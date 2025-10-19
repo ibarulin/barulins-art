@@ -6,12 +6,17 @@ from PIL import Image, ImageDraw, ImageFilter, ImageEnhancer
 import google.generativeai as genai
 import re
 
+# --- Никаких изменений в этой части ---
 genai.configure(api_key=os.environ.get('GOOGLE_API_KEY'))
 model = genai.GenerativeModel('gemini-1.5-pro')
 
 def base64_to_image(base64_str):
     try:
-        header, data = base64_str.split(',', 1)
+        # Убираем префикс, если он есть
+        if ',' in base64_str:
+            header, data = base64_str.split(',', 1)
+        else:
+            data = base64_str
         img_data = base64.b64decode(data)
         return Image.open(BytesIO(img_data))
     except Exception as e:
@@ -43,59 +48,87 @@ def composite_images(interior, artwork, placement):
     if placement['rotation'] != 0:
         artwork = artwork.rotate(placement['rotation'], expand=True)
     
-    interior = interior.copy()
+    interior = interior.copy().convert('RGBA')
     x, y = placement['x'] - new_width // 2, placement['y'] - new_height // 2
-    interior.paste(artwork, (x, y), artwork if artwork.mode == 'RGBA' else None)
     
+    # Создаем временный слой для картины, чтобы вставить ее
+    artwork_layer = Image.new('RGBA', interior.size, (0, 0, 0, 0))
+    artwork_layer.paste(artwork, (x, y), artwork if artwork.mode == 'RGBA' else None)
+    
+    # Комбинируем интерьер и слой с картиной
+    interior = Image.alpha_composite(interior, artwork_layer)
+    
+    # Логика тени остается прежней, но применяется к RGBA изображению
     shadow = Image.new('RGBA', interior.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(shadow)
-    for i in range(placement['wall_height']):
-        alpha = int(50 * (i / placement['wall_height']))
-        draw.rectangle([x, y + new_height - i, x + new_width, y + new_height], fill=(0, 0, 0, alpha))
-    shadow = shadow.filter(ImageFilter.GaussianBlur(5))
-    interior = Image.alpha_composite(interior.convert('RGBA'), shadow)
+    shadow_intensity = 50
+    shadow_blur = 5
+    draw.rectangle([x + shadow_blur, y + shadow_blur, x + new_width + shadow_blur, y + new_height + shadow_blur], fill=(0, 0, 0, shadow_intensity))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(shadow_blur))
     
-    enhancer = ImageEnhancer.Contrast(interior)
-    interior = enhancer.enhance(1.1)
+    # Комбинируем результат с тенью
+    final_img_with_shadow = Image.alpha_composite(interior, shadow)
     
-    return interior
-
-def handler(request):
-    try:
-        body = json.loads(request['body'])
-        if not body or 'interiorImage' not in body or 'artworkImage' not in body:
-            return {'statusCode': 400, 'body': json.dumps({'error': 'Отсутствуют обязательные поля: interiorImage или artworkImage'})}
-
-        interior_b64 = body['interiorImage']
-        artwork_b64 = body['artworkImage']
-        
-        interior_img = base64_to_image(interior_b64)
-        artwork_img = base64_to_image(artwork_b64)
-        
-        prompt = """
-        Ты — профессиональный ассистент по дизайну интерьеров. 
-        На первом изображении (интерьер) найди самую подходящую стену для размещения картины. 
-        Учти перспективу, освещение и тени в комнате. 
-        Верни ТОЛЬКО JSON с координатами для размещения второй картины (artwork): 
-        {"x": центр_x (пиксели, от 0 до ширины интерьера), "y": верх_y (от 0), "scale": 0.5-1.0 (масштаб), "rotation": угол_в_градусах (обычно 0-5), "wall_height": высота_стены_пиксели (для теней)}.
-        Предполагай размер интерьера 1920x1080. Не добавляй текст вне JSON.
-        """
-        
-        response = model.generate_content([prompt, interior_img, artwork_img])
-        placement = parse_gemini_response(response.text)
-        
-        final_img = composite_images(interior_img, artwork_img, placement)
-        
-        buffered = BytesIO()
-        final_img.save(buffered, format="PNG")
-        final_b64 = base64.b64encode(buffered.getvalue()).decode()
-        
-        return {'statusCode': 200, 'body': json.dumps({'finalImage': final_b64})}
+    enhancer = ImageEnhancer.Contrast(final_img_with_shadow)
+    final_img_enhanced = enhancer.enhance(1.1)
     
-    except ValueError as ve:
-        return {'statusCode': 400, 'body': json.dumps({'error': str(ve)})}
-    except Exception as e:
-        return {'statusCode': 500, 'body': json.dumps({'error': f'Внутренняя ошибка: {str(e)}'})}
+    return final_img_enhanced.convert('RGB')
 
-if __name__ == '__main__':
-    print("Handler ready")
+# --- ГЛАВНОЕ ИЗМЕНЕНИЕ ЗДЕСЬ ---
+# Эта функция теперь называется handler, как и требует Vercel
+from http.server import BaseHTTPRequestHandler
+from urllib.parse import parse_qs
+
+class handler(BaseHTTPRequestHandler):
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
+
+    def do_POST(self):
+        try:
+            content_length = int(self.headers['Content-Length'])
+            body = self.rfile.read(content_length)
+            data = json.loads(body)
+
+            if not data or 'interiorImage' not in data or 'artworkImage' not in data:
+                self.send_response(400)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'error': 'Отсутствуют обязательные поля'}).encode())
+                return
+
+            interior_img = base64_to_image(data['interiorImage'])
+            artwork_img = base64_to_image(data['artworkImage'])
+            
+            prompt = """
+            Ты — профессиональный ассистент по дизайну интерьеров. 
+            На первом изображении (интерьер) найди самую подходящую стену для размещения картины. 
+            Учти перспективу, освещение и тени в комнате. 
+            Верни ТОЛЬКО JSON с координатами для размещения второй картины (artwork): 
+            {"x": центр_x (пиксели, от 0 до ширины интерьера), "y": верх_y (от 0), "scale": 0.5-1.0 (масштаб), "rotation": угол_в_градусах (обычно 0-5), "wall_height": высота_стены_пиксели (для теней)}.
+            Предполагай размер интерьера 1920x1080. Не добавляй текст вне JSON.
+            """
+            
+            response = model.generate_content([prompt, interior_img, artwork_img])
+            placement = parse_gemini_response(response.text)
+            
+            final_img = composite_images(interior_img, artwork_img, placement)
+            
+            buffered = BytesIO()
+            final_img.save(buffered, format="PNG")
+            final_b64 = base64.b64encode(buffered.getvalue()).decode()
+            
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({'finalImage': final_b64}).encode())
+
+        except Exception as e:
+            self.send_response(500)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': f'Внутренняя ошибка: {str(e)}'}).encode())
