@@ -1,15 +1,10 @@
 import os
-import base64
 import json
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import google.generativeai as genai
-from PIL import Image, ImageDraw, ImageFilter, ImageEnhancer
+import base64
 from io import BytesIO
+from PIL import Image, ImageDraw, ImageFilter, ImageEnhancer
+import google.generativeai as genai
 import re
-
-app = Flask(__name__)
-CORS(app, origins=["https://barulins.art", "https://*.barulins.art"])
 
 genai.configure(api_key=os.environ.get('GOOGLE_API_KEY'))
 model = genai.GenerativeModel('gemini-1.5-pro')
@@ -65,15 +60,14 @@ def composite_images(interior, artwork, placement):
     
     return interior
 
-@app.route('/', methods=['POST'])
-def process_image():
+def handler(request):
     try:
-        data = request.get_json()
-        if not data or 'interiorImage' not in data or 'artworkImage' not in data:
-            return jsonify({'error': 'Отсутствуют обязательные поля: interiorImage или artworkImage'}), 400
-        
-        interior_b64 = data['interiorImage']
-        artwork_b64 = data['artworkImage']
+        body = json.loads(request['body'])
+        if not body or 'interiorImage' not in body or 'artworkImage' not in body:
+            return {'statusCode': 400, 'body': json.dumps({'error': 'Отсутствуют обязательные поля: interiorImage или artworkImage'})}
+
+        interior_b64 = body['interiorImage']
+        artwork_b64 = body['artworkImage']
         
         interior_img = base64_to_image(interior_b64)
         artwork_img = base64_to_image(artwork_b64)
@@ -96,12 +90,12 @@ def process_image():
         final_img.save(buffered, format="PNG")
         final_b64 = base64.b64encode(buffered.getvalue()).decode()
         
-        return jsonify({'finalImage': final_b64})
+        return {'statusCode': 200, 'body': json.dumps({'finalImage': final_b64})}
     
     except ValueError as ve:
-        return jsonify({'error': str(ve)}), 400
+        return {'statusCode': 400, 'body': json.dumps({'error': str(ve)})}
     except Exception as e:
-        return jsonify({'error': f'Внутренняя ошибка: {str(e)}'}), 500
+        return {'statusCode': 500, 'body': json.dumps({'error': f'Внутренняя ошибка: {str(e)}'})}
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    print("Handler ready")
