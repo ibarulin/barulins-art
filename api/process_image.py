@@ -9,14 +9,12 @@ from io import BytesIO
 import re
 
 app = Flask(__name__)
-CORS(app, origins=["https://barulins.art", "https://*.barulins.art"])  # CORS для твоего домена
+CORS(app, origins=["https://barulins.art", "https://*.barulins.art"])
 
-# Конфиг Gemini
 genai.configure(api_key=os.environ.get('GOOGLE_API_KEY'))
 model = genai.GenerativeModel('gemini-1.5-pro')
 
 def base64_to_image(base64_str):
-    """Конвертирует Base64 в PIL Image"""
     try:
         header, data = base64_str.split(',', 1)
         img_data = base64.b64decode(data)
@@ -25,58 +23,49 @@ def base64_to_image(base64_str):
         raise ValueError(f"Ошибка декодирования Base64: {str(e)}")
 
 def parse_gemini_response(response_text):
-    """Парсит ответ Gemini в координаты/масштаб (ожидаем JSON-подобный текст)"""
     try:
-        # Ищем JSON в ответе (промпт заставит вернуть чистый JSON)
         json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
         if json_match:
             data = json.loads(json_match.group())
             return {
-                'x': int(data.get('x', 0.5 * 1920)),  # Центр по умолчанию, ширина 1920
-                'y': int(data.get('y', 0.3 * 1080)),  # Верх стены
+                'x': int(data.get('x', 960)),
+                'y': int(data.get('y', 324)),
                 'scale': float(data.get('scale', 0.8)),
-                'rotation': float(data.get('rotation', 0)),  # Угол для перспективы
-                'wall_height': int(data.get('wall_height', 600))  # Высота стены для теней
+                'rotation': float(data.get('rotation', 0)),
+                'wall_height': int(data.get('wall_height', 600))
             }
         else:
-            # Fallback: центр
             return {'x': 960, 'y': 324, 'scale': 0.8, 'rotation': 0, 'wall_height': 600}
     except:
         return {'x': 960, 'y': 324, 'scale': 0.8, 'rotation': 0, 'wall_height': 600}
 
 def composite_images(interior, artwork, placement):
-    """Композитинг: вписывает artwork в interior по placement"""
-    # Масштабируем artwork
     art_width, art_height = artwork.size
     new_width = int(art_width * placement['scale'])
     new_height = int(art_height * placement['scale'])
     artwork = artwork.resize((new_width, new_height), Image.Resampling.LANCZOS)
     
-    # Поворот для перспективы (простой)
     if placement['rotation'] != 0:
         artwork = artwork.rotate(placement['rotation'], expand=True)
     
-    # Накладываем на интерьер
     interior = interior.copy()
     x, y = placement['x'] - new_width // 2, placement['y'] - new_height // 2
     interior.paste(artwork, (x, y), artwork if artwork.mode == 'RGBA' else None)
     
-    # Добавляем тени (простой градиент снизу)
     shadow = Image.new('RGBA', interior.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(shadow)
     for i in range(placement['wall_height']):
-        alpha = int(50 * (i / placement['wall_height']))  # Градиент тени
+        alpha = int(50 * (i / placement['wall_height']))
         draw.rectangle([x, y + new_height - i, x + new_width, y + new_height], fill=(0, 0, 0, alpha))
     shadow = shadow.filter(ImageFilter.GaussianBlur(5))
     interior = Image.alpha_composite(interior.convert('RGBA'), shadow)
     
-    # Сохраняем освещение (контраст)
     enhancer = ImageEnhancer.Contrast(interior)
     interior = enhancer.enhance(1.1)
     
     return interior
 
-@app.route('/processImage', methods=['POST'])
+@app.route('/', methods=['POST'])
 def process_image():
     try:
         data = request.get_json()
@@ -89,7 +78,6 @@ def process_image():
         interior_img = base64_to_image(interior_b64)
         artwork_img = base64_to_image(artwork_b64)
         
-        # Промпт для Gemini
         prompt = """
         Ты — профессиональный ассистент по дизайну интерьеров. 
         На первом изображении (интерьер) найди самую подходящую стену для размещения картины. 
@@ -99,14 +87,11 @@ def process_image():
         Предполагай размер интерьера 1920x1080. Не добавляй текст вне JSON.
         """
         
-        # Запрос к Gemini
         response = model.generate_content([prompt, interior_img, artwork_img])
         placement = parse_gemini_response(response.text)
         
-        # Композитинг
         final_img = composite_images(interior_img, artwork_img, placement)
         
-        # Base64 обратно
         buffered = BytesIO()
         final_img.save(buffered, format="PNG")
         final_b64 = base64.b64encode(buffered.getvalue()).decode()
